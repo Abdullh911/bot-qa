@@ -33,6 +33,70 @@ function truncate(text, maxLength = 280) {
   return `${value.slice(0, maxLength - 3).trim()}...`;
 }
 
+function normalizeMessageText(text) {
+  return `${text || ""}`
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const PURE_GREETING_PATTERNS = [
+  /^hi+$/,
+  /^hey+$/,
+  /^hello+$/,
+  /^good morning$/,
+  /^good afternoon$/,
+  /^good evening$/,
+  /^السلام عليكم(?: ورحمة الله وبركاته)?$/,
+  /^اهلا$/,
+  /^أهلا$/,
+  /^اهلا وسهلا$/,
+  /^أهلا وسهلا$/,
+  /^مرحبا$/,
+  /^مرحب[اى]$/,
+  /^هلا$/,
+  /^هاي$/,
+  /^صباح الخير$/,
+  /^مساء الخير$/,
+  /^يسعد صباحك$/,
+  /^يسعد مساك$/
+];
+
+const GREETING_WITH_COURTESY_PATTERNS = [
+  /^السلام عليكم(?: ورحمة الله وبركاته)?(?: يا?\s*\S+)?(?: لو سمحت| بعد اذنك| من فضلك)?$/,
+  /^اهلا(?: وسهلا)?(?: لو سمحت| بعد اذنك| من فضلك)?$/,
+  /^أهلا(?: وسهلا)?(?: لو سمحت| بعد اذنك| من فضلك)?$/,
+  /^مرحبا(?: لو سمحت| بعد اذنك| من فضلك)?$/,
+  /^مرحب[اى](?: لو سمحت| بعد اذنك| من فضلك)?$/,
+  /^hi(?: please)?$/,
+  /^hello(?: please)?$/,
+  /^hey(?: please)?$/
+];
+
+function isGreetingMessage(text) {
+  const normalized = normalizeMessageText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return [...PURE_GREETING_PATTERNS, ...GREETING_WITH_COURTESY_PATTERNS].some((pattern) =>
+    pattern.test(normalized)
+  );
+}
+
+function buildGreetingReply(detectedLang, config) {
+  if (detectedLang === "ar") {
+    return `وعليكم السلام ورحمة الله وبركاته.\n\nأهلاً وسهلاً بك في ${config.name}. كيف أقدر أساعدك اليوم؟`;
+  }
+
+  if (detectedLang === "en") {
+    return `Hello and welcome to ${config.name}. How can I help you today?`;
+  }
+
+  return `Hello and welcome to ${config.name}. How can I help you today?`;
+}
+
 function summarizeKbResults(kbResults) {
   return (kbResults || []).map((item) => ({
     id: item.id,
@@ -456,6 +520,48 @@ async function processIncomingMessage(incoming) {
   }
 
   const detectedLang = detectLanguage(parsed.text);
+
+  if (isGreetingMessage(parsed.text)) {
+    const greetingReply = buildGreetingReply(detectedLang, config);
+    const textSend = await whatsappService.sendText(parsed.from, greetingReply);
+
+    await supabaseService.appendConversationMessages(
+      env.businessId,
+      parsed.from,
+      [
+        buildConversationEntry("user", parsed.text, {
+          message_id: parsed.messageId
+        }),
+        buildConversationEntry("assistant", greetingReply, {
+          retrieval_mode: "greeting_shortcut",
+          input_tokens: 0,
+          output_tokens: 0,
+          cost_usd: 0
+        })
+      ],
+      env.maxHistoryMessages
+    );
+
+    logger.info(
+      {
+        ...logContext,
+        detectedLanguage: detectedLang,
+        outgoingText: greetingReply,
+        textChunkCount: textSend.chunks.length,
+        textChunks: textSend.chunks.map((item) => ({
+          id: item.id,
+          preview: truncate(item.chunk, 160)
+        })),
+        retrievalMode: "greeting_shortcut",
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0
+      },
+      "Greeting shortcut reply sent without retrieval or model call."
+    );
+    return;
+  }
+
   logger.info(
     {
       ...logContext,
