@@ -585,7 +585,10 @@ async function processIncomingMessage(incoming) {
     );
 
     const { kbResults, retrievalMode } = await getKnowledgeResults(parsed.text, config);
-    const history = await supabaseService.getConversation(env.businessId, parsed.from);
+    const fullHistory = await supabaseService.getConversation(env.businessId, parsed.from);
+    const history = Array.isArray(fullHistory)
+      ? fullHistory.slice(-Math.max(env.maxHistoryMessages, 1))
+      : [];
     const imageIntent = getImageIntentDecision(parsed.text, kbResults);
 
     logger.info(
@@ -595,6 +598,7 @@ async function processIncomingMessage(incoming) {
         kbMatchCount: kbResults.length,
         kbMatches: summarizeKbResults(kbResults),
         imageIntent,
+        fullHistoryCount: Array.isArray(fullHistory) ? fullHistory.length : 0,
         historyCount: history.length,
         historyPreview: summarizeHistory(history)
       },

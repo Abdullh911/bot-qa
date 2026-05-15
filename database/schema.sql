@@ -201,23 +201,8 @@ begin
   on conflict (business_id, customer_phone)
   do update
   set
-    messages = (
-      with merged as (
-        select value, ord
-        from jsonb_array_elements(
-          coalesce(conversations.messages, '[]'::jsonb) ||
-          coalesce(excluded.messages, '[]'::jsonb)
-        ) with ordinality as t(value, ord)
-      ),
-      trimmed as (
-        select value, ord
-        from merged
-        order by ord desc
-        limit greatest(max_messages_input, 1)
-      )
-      select coalesce(jsonb_agg(value order by ord), '[]'::jsonb)
-      from trimmed
-    ),
+    messages = coalesce(conversations.messages, '[]'::jsonb) ||
+      coalesce(excluded.messages, '[]'::jsonb),
     updated_at = now()
   returning messages into merged_messages;
 
