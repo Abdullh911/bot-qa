@@ -1,7 +1,7 @@
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 const { detectLanguage } = require("../utils/languageDetector");
-const { chooseRelevantImages, parseImageTags, stripImageTags } = require("../utils/imageDecider");
+const { chooseRelevantImages, hasImageIntent, parseImageTags, stripImageTags } = require("../utils/imageDecider");
 const { calculateCost } = require("../utils/costCalculator");
 const { parseMessage, extractMessagesFromWebhook } = require("../utils/messageParser");
 const supabaseService = require("../services/supabaseService");
@@ -65,6 +65,22 @@ function summarizePrompt(messages) {
     chars: `${item.content || ""}`.length,
     preview: truncate(item.content, item.role === "system" ? 220 : 140)
   }));
+}
+
+function dedupeImages(images) {
+  const seen = new Set();
+  const result = [];
+
+  for (const image of images || []) {
+    if (!image || !image.id || seen.has(image.id)) {
+      continue;
+    }
+
+    seen.add(image.id);
+    result.push(image);
+  }
+
+  return result;
 }
 
 async function getKnowledgeResults(userText, config) {
@@ -267,10 +283,26 @@ async function processIncomingMessage(incoming) {
 
   const chatResult = await openrouterService.chat(prompt);
   const cleanReply = stripImageTags(chatResult.reply) || config.fallback_msg;
+  const userRequestedImages = hasImageIntent(parsed.text);
   const requestedImageIds = parseImageTags(chatResult.reply);
   const allowedImageMap = new Map(relevantImages.map((image) => [image.id, image]));
   const approvedImageIds = Array.from(new Set(requestedImageIds));
-  const approvedImages = approvedImageIds.map((imageId) => allowedImageMap.get(imageId)).filter(Boolean);
+  const modelApprovedImages = approvedImageIds
+    .map((imageId) => allowedImageMap.get(imageId))
+    .filter(Boolean);
+  const approvedImages = dedupeImages(
+    userRequestedImages
+      ? [...relevantImages, ...modelApprovedImages]
+      : modelApprovedImages
+  );
+  const imageDeliveryStrategy =
+    userRequestedImages && approvedImages.length > 0
+      ? requestedImageIds.length > 0
+        ? "user_intent_plus_model_tags"
+        : "user_intent_auto_send_all_relevant"
+      : requestedImageIds.length > 0
+        ? "model_tags_only"
+        : "no_images_sent";
 
   logger.info(
     {
@@ -278,9 +310,11 @@ async function processIncomingMessage(incoming) {
       model: env.openrouterModel,
       rawModelReply: chatResult.reply,
       cleanReply,
+      userRequestedImages,
       requestedImageIds,
       approvedImageIds,
       approvedImages: summarizeImages(approvedImages),
+      imageDeliveryStrategy,
       inputTokens: chatResult.inputTokens,
       outputTokens: chatResult.outputTokens
     },
@@ -334,6 +368,8 @@ async function processIncomingMessage(incoming) {
     logger.info(
       {
         ...logContext,
+        userRequestedImages,
+        imageDeliveryStrategy,
         sentImages
       },
       "WhatsApp image replies sent."

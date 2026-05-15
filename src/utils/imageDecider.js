@@ -213,6 +213,7 @@ function stripImageTags(replyText) {
 
 module.exports = {
   chooseRelevantImages,
+  hasImageIntent,
   parseImageTags,
   stripImageTags
 };
