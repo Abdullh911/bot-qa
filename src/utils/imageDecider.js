@@ -64,6 +64,43 @@ const IMAGE_INTENT_TERMS = new Set([
   "\u0641\u0648\u062a\u0648"
 ]);
 
+const VISUAL_REQUEST_TERMS = [
+  "show",
+  "see",
+  "view",
+  "look",
+  "browse",
+  "check",
+  "\u0627\u0634\u0648\u0641",
+  "\u0623\u0634\u0648\u0641",
+  "\u0634\u0648\u0641",
+  "\u0648\u0631\u064a\u0646\u064a",
+  "\u0648\u0631\u064a\u0646\u0649",
+  "\u0627\u0648\u0631\u064a\u0646\u064a",
+  "\u0627\u0631\u064a\u0646\u064a",
+  "\u0623\u0631\u0646\u064a",
+  "\u0627\u0639\u0631\u0636",
+  "\u0639\u0631\u0636",
+  "\u0646\u0634\u0648\u0641"
+];
+
+const PRODUCT_REFERENCE_TERMS = [
+  "product",
+  "products",
+  "item",
+  "items",
+  "catalog",
+  "\u0645\u0646\u062a\u062c",
+  "\u0645\u0646\u062a\u062c\u0627\u062a",
+  "\u0627\u0644\u0645\u0646\u062a\u062c\u0627\u062a",
+  "\u0627\u0644\u0628\u0636\u0627\u0639\u0629",
+  "\u0628\u0636\u0627\u0639\u0629"
+];
+
+function normalizeText(value) {
+  return `${value || ""}`.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 function tokenize(text) {
   return `${text || ""}`
     .toLowerCase()
@@ -99,7 +136,25 @@ function buildKnowledgeCorpus(kbResults) {
     .join(" ");
 }
 
+function kbHasImageEvidence(kbResults) {
+  return (kbResults || []).some((item) => {
+    const normalizedCategory = normalizeText(item && item.category);
+    const normalizedText = normalizeText(
+      [item && item.title, item && item.content].filter(Boolean).join(" ")
+    );
+
+    return (
+      normalizedCategory === "images" ||
+      normalizedText.includes("image url") ||
+      normalizedText.includes("/storage/v1/object/public/") ||
+      normalizedText.includes("image description:")
+    );
+  });
+}
+
 function hasImageIntent(queryText) {
+  const normalizedText = normalizeText(queryText);
+
   return uniqueTokens(queryText).some(
     (token) =>
       IMAGE_INTENT_TERMS.has(token) ||
@@ -109,7 +164,47 @@ function hasImageIntent(queryText) {
       token.includes("photo") ||
       token.includes("picture") ||
       token.includes("pic")
-  );
+  ) || VISUAL_REQUEST_TERMS.some((term) => normalizedText.includes(term));
+}
+
+function getImageIntentDecision(queryText, kbResults = []) {
+  const normalizedText = normalizeText(queryText);
+  const explicitImageIntent = hasImageIntent(queryText);
+  const visualRequest = VISUAL_REQUEST_TERMS.some((term) => normalizedText.includes(term));
+  const productReference = PRODUCT_REFERENCE_TERMS.some((term) => normalizedText.includes(term));
+  const hasKbEvidence = kbHasImageEvidence(kbResults);
+  const reasons = [];
+  let confidence = 0;
+
+  if (explicitImageIntent) {
+    confidence += 0.7;
+    reasons.push("explicit_image_intent");
+  }
+
+  if (visualRequest) {
+    confidence += explicitImageIntent ? 0.1 : 0.4;
+    reasons.push("visual_request_language");
+  }
+
+  if (productReference && (explicitImageIntent || visualRequest)) {
+    confidence += 0.15;
+    reasons.push("product_reference");
+  }
+
+  if (hasKbEvidence) {
+    confidence += explicitImageIntent || visualRequest ? 0.2 : 0.05;
+    reasons.push("kb_image_evidence");
+  }
+
+  confidence = Math.min(1, Number(confidence.toFixed(4)));
+
+  return {
+    confidence,
+    wantsImages: confidence >= 0.45,
+    shouldAutoSend: confidence >= 0.45 && hasKbEvidence,
+    hasKbEvidence,
+    reasons
+  };
 }
 
 function buildKbText(item) {
@@ -158,10 +253,11 @@ function findDirectKbMatch(image, kbResults) {
   };
 }
 
-function chooseRelevantImages({ queryText, kbResults, images, maxImages = 3 }) {
+function chooseRelevantImages({ queryText, kbResults, images, maxImages = 3, imageIntent }) {
   const queryTokens = uniqueTokens(queryText);
   const kbTokens = uniqueTokens(buildKnowledgeCorpus(kbResults));
-  const queryWantsImage = hasImageIntent(queryText);
+  const decision = imageIntent || getImageIntentDecision(queryText, kbResults);
+  const queryWantsImage = decision.wantsImages;
 
   const ranked = (images || [])
     .map((image) => {
@@ -179,7 +275,7 @@ function chooseRelevantImages({ queryText, kbResults, images, maxImages = 3 }) {
       const baseScore = Number((queryScore * 0.65 + kbScore * 0.35).toFixed(4));
       const directKbMatch = findDirectKbMatch(image, kbResults);
       const qualifiesByOverlap = queryScore >= 0.2 && kbScore >= 0.08;
-      const qualifiesByIntentAndKb = queryWantsImage && directKbMatch.matched;
+      const qualifiesByIntentAndKb = decision.shouldAutoSend && directKbMatch.matched;
       const combinedScore = Number(
         Math.max(baseScore, qualifiesByIntentAndKb ? 0.3 + kbScore * 0.7 : baseScore).toFixed(4)
       );
@@ -199,7 +295,7 @@ function chooseRelevantImages({ queryText, kbResults, images, maxImages = 3 }) {
     })
     .filter((image) => {
       const qualifiesByOverlap = image.queryScore >= 0.2 && image.kbScore >= 0.08;
-      const qualifiesByIntentAndKb = queryWantsImage && image.directKbMatch;
+      const qualifiesByIntentAndKb = decision.shouldAutoSend && image.directKbMatch;
       return qualifiesByOverlap || qualifiesByIntentAndKb;
     })
     .sort((a, b) => b.combinedScore - a.combinedScore)
@@ -222,6 +318,7 @@ function stripImageTags(replyText) {
 
 module.exports = {
   chooseRelevantImages,
+  getImageIntentDecision,
   hasImageIntent,
   parseImageTags,
   stripImageTags

@@ -1,7 +1,12 @@
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 const { detectLanguage } = require("../utils/languageDetector");
-const { chooseRelevantImages, hasImageIntent, parseImageTags, stripImageTags } = require("../utils/imageDecider");
+const {
+  chooseRelevantImages,
+  getImageIntentDecision,
+  parseImageTags,
+  stripImageTags
+} = require("../utils/imageDecider");
 const { calculateCost } = require("../utils/costCalculator");
 const { parseMessage, extractMessagesFromWebhook } = require("../utils/messageParser");
 const supabaseService = require("../services/supabaseService");
@@ -261,6 +266,7 @@ async function processIncomingMessage(incoming) {
 
   const { kbResults, retrievalMode } = await getKnowledgeResults(parsed.text, config);
   const history = await supabaseService.getConversation(env.businessId, parsed.from);
+  const imageIntent = getImageIntentDecision(parsed.text, kbResults);
 
   logger.info(
     {
@@ -268,6 +274,7 @@ async function processIncomingMessage(incoming) {
       retrievalMode,
       kbMatchCount: kbResults.length,
       kbMatches: summarizeKbResults(kbResults),
+      imageIntent,
       historyCount: history.length,
       historyPreview: summarizeHistory(history)
     },
@@ -306,12 +313,14 @@ async function processIncomingMessage(incoming) {
     queryText: parsed.text,
     kbResults,
     images,
-    maxImages: env.maxCandidateImages
+    maxImages: env.maxCandidateImages,
+    imageIntent
   });
 
   logger.info(
     {
       ...logContext,
+      imageIntent,
       activeImageCount: images.length,
       relevantImageCount: relevantImages.length,
       relevantImages: summarizeImages(relevantImages)
@@ -339,23 +348,23 @@ async function processIncomingMessage(incoming) {
 
   const chatResult = await openrouterService.chat(prompt);
   const cleanReply = stripImageTags(chatResult.reply) || config.fallback_msg;
-  const userRequestedImages = hasImageIntent(parsed.text);
+  const userRequestedImages = imageIntent.wantsImages;
   const requestedImageIds = parseImageTags(chatResult.reply);
-  const allowedImageMap = buildAllowedImageMap(relevantImages);
+  const allowedImageMap = buildAllowedImageMap(images);
   const approvedImageIds = Array.from(new Set(requestedImageIds.map(normalizeReference)));
   const modelApprovedImages = approvedImageIds
     .map((imageId) => allowedImageMap.get(imageId))
     .filter(Boolean);
   const approvedImages = dedupeImages(
-    userRequestedImages
+    imageIntent.shouldAutoSend
       ? [...relevantImages, ...modelApprovedImages]
       : modelApprovedImages
   );
   const imageDeliveryStrategy =
-    userRequestedImages && approvedImages.length > 0
+    imageIntent.shouldAutoSend && approvedImages.length > 0
       ? requestedImageIds.length > 0
-        ? "user_intent_plus_model_tags"
-        : "user_intent_auto_send_all_relevant"
+        ? "auto_send_relevant_plus_model_tags"
+        : "auto_send_relevant_from_search"
       : requestedImageIds.length > 0
         ? "model_tags_only"
         : "no_images_sent";
@@ -366,6 +375,7 @@ async function processIncomingMessage(incoming) {
       model: env.openrouterModel,
       rawModelReply: chatResult.reply,
       cleanReply,
+      imageIntent,
       userRequestedImages,
       requestedImageIds,
       approvedImageIds,
