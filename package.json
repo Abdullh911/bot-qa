@@ -15,6 +15,7 @@
     "check": "node --check src/index.js && node --check src/controllers/messageController.js && node --check src/services/openrouterService.js && node --check src/services/supabaseService.js && node --check src/services/vectorSearchService.js && node --check src/services/promptBuilder.js && node --check src/utils/imageDecider.js && node --check scripts/embedAllKB.js && node --check scripts/createBusiness.js"
   },
   "dependencies": {
+    "@huggingface/inference": "^4.9.3",
     "@supabase/supabase-js": "^2.49.8",
     "axios": "^1.8.4",
     "dotenv": "^16.5.0",

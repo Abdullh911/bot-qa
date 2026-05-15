@@ -54,7 +54,7 @@ const env = {
   openrouterTemperature: optionalNumber("OPENROUTER_TEMPERATURE", 0.35),
 
   hfApiToken: required("HF_API_TOKEN", ["hf_token"]),
-  hfEmbeddingModel: optional("HF_EMBEDDING_MODEL", "BAAI/bge-m3"),
+  hfEmbeddingModel: optional("HF_EMBEDDING_MODEL", "intfloat/multilingual-e5-large"),
 
   supabaseUrl: required("SUPABASE_URL"),
   supabaseServiceKey: required("SUPABASE_SERVICE_KEY"),

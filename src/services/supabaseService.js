@@ -149,7 +149,7 @@ async function updateKnowledgeBaseEmbedding(kbId, embedding) {
 async function listKnowledgeBaseEntriesToEmbed(businessId) {
   const { data, error } = await supabase
     .from("knowledge_base")
-    .select("id, title, content")
+    .select("id, category, title, content")
     .eq("business_id", businessId)
     .eq("is_active", true)
     .is("embedding", null)

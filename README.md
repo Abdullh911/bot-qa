@@ -5,7 +5,7 @@ This folder contains the production bot implementation from the V4 plan:
 - Express webhook server for WhatsApp Cloud API
 - Supabase-backed business config, KB search, conversations, images, and balance deduction
 - OpenRouter response generation with exact token-cost deduction
-- Hugging Face embeddings for vector search
+- Hugging Face embeddings for vector search using `intfloat/multilingual-e5-large`
 - Top 10 KB retrieval by default
 - Relevant image sending only when the image overlaps with both the customer query and matched knowledge
 

@@ -14,8 +14,12 @@ async function main() {
   logger.info({ count: entries.length }, "Embedding pending knowledge base entries.");
 
   for (const entry of entries) {
-    const text = [entry.title, entry.content].filter(Boolean).join("\n\n");
-    const embedding = await vectorSearchService.generateEmbedding(text);
+    const text = [entry.category, entry.title, entry.content]
+      .filter(Boolean)
+      .join("\n\n");
+    const embedding = await vectorSearchService.generateEmbedding(text, {
+      mode: "passage"
+    });
     await supabaseService.updateKnowledgeBaseEmbedding(entry.id, embedding);
     logger.info({ id: entry.id, title: entry.title }, "Embedded knowledge base entry.");
   }

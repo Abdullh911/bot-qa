@@ -30,7 +30,9 @@ async function getKnowledgeResults(userText, config) {
   );
 
   try {
-    const queryEmbedding = await vectorSearchService.generateEmbedding(userText);
+    const queryEmbedding = await vectorSearchService.generateEmbedding(userText, {
+      mode: "query"
+    });
     const kbResults = await supabaseService.searchKnowledgeBase({
       queryEmbedding,
       businessId: env.businessId,
