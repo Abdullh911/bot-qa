@@ -1,6 +1,6 @@
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
-const { detectLanguage } = require("../utils/languageDetector");
+const { detectLanguage, getLanguageInstruction } = require("../utils/languageDetector");
 const {
   chooseRelevantImages,
   getImageIntentDecision,
@@ -70,6 +70,101 @@ function summarizePrompt(messages) {
     chars: `${item.content || ""}`.length,
     preview: truncate(item.content, item.role === "system" ? 220 : 140)
   }));
+}
+
+function extractSnippet(text, maxLength = 220) {
+  const value = `${text || ""}`.replace(/\s+/g, " ").trim();
+  if (!value) {
+    return "";
+  }
+
+  const firstSentence = value.split(/(?<=[.!?؟])\s+/)[0];
+  return truncate(firstSentence || value, maxLength);
+}
+
+function buildRetryPrompt({ userText, kbResults, relevantImages, config, detectedLang, imageIntent }) {
+  const knowledgeSummary = kbResults
+    .slice(0, 3)
+    .map((item, index) => [
+      `[KB ${index + 1}] ${item.title || "Untitled"}`,
+      `Category: ${item.category || "General"}`,
+      `Content: ${extractSnippet(item.content, 320)}`
+    ].join("\n"))
+    .join("\n\n");
+
+  const imageSummary = relevantImages.length > 0
+    ? relevantImages
+        .slice(0, 3)
+        .map((image, index) => [
+          `[IMAGE ${index + 1}] id=${image.id}`,
+          `Caption: ${image.caption || "none"}`,
+          `Description: ${extractSnippet(image.description, 160)}`
+        ].join("\n"))
+        .join("\n\n")
+    : "No image candidates are needed unless the user explicitly asked to see them.";
+
+  const systemPrompt = `
+You are ${config.bot_name}, the WhatsApp assistant for ${config.name}.
+${getLanguageInstruction(detectedLang, config.language_hint)}
+
+Answer in 2 to 4 short sentences using only the knowledge below.
+Do not leave the answer blank.
+Do not mention internal tools or retrieval.
+If the answer is unsupported, reply exactly: "${config.fallback_msg}"
+${imageIntent.shouldAutoSend ? "If relevant images exist, you may mention that images are being shared." : ""}
+
+Knowledge:
+${knowledgeSummary}
+
+Images:
+${imageSummary}
+`.trim();
+
+  return [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userText }
+  ];
+}
+
+function buildGroundedFallbackReply({ kbResults, detectedLang, relevantImages, imageIntent, config }) {
+  if (!kbResults || kbResults.length === 0) {
+    return config.fallback_msg;
+  }
+
+  const lines = kbResults
+    .slice(0, 3)
+    .map((item) => `- ${item.title || item.category || "Info"}: ${extractSnippet(item.content, 220)}`)
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return config.fallback_msg;
+  }
+
+  if (detectedLang === "ar") {
+    return [
+      "بناءً على المعلومات المتاحة لدينا، هذه أهم التفاصيل:",
+      ...lines,
+      imageIntent.shouldAutoSend && relevantImages.length > 0
+        ? "وأرسلت لك الصور المتاحة ذات الصلة."
+        : ""
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return [
+    "Based on the available information, here are the main details:",
+    ...lines,
+    imageIntent.shouldAutoSend && relevantImages.length > 0
+      ? "I also shared the available relevant images."
+      : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function hasUsableReply(reply) {
+  return stripImageTags(reply).trim().length > 0;
 }
 
 function dedupeImages(images) {
@@ -142,6 +237,119 @@ function buildAllowedImageMap(images) {
   }
 
   return map;
+}
+
+async function generateReplyWithRecovery({
+  prompt,
+  userText,
+  kbResults,
+  relevantImages,
+  config,
+  detectedLang,
+  imageIntent,
+  logContext
+}) {
+  const attempts = [];
+
+  try {
+    const primary = await openrouterService.chat(prompt);
+    attempts.push({
+      stage: "primary",
+      ok: hasUsableReply(primary.reply),
+      inputTokens: primary.inputTokens,
+      outputTokens: primary.outputTokens,
+      rawReply: primary.reply
+    });
+
+    if (hasUsableReply(primary.reply)) {
+      return {
+        reply: primary.reply,
+        inputTokens: primary.inputTokens,
+        outputTokens: primary.outputTokens,
+        attempts,
+        recoveryMode: "primary"
+      };
+    }
+  } catch (error) {
+    logger.warn(
+      {
+        ...logContext,
+        err: error
+      },
+      "Primary model call failed or returned unusable output."
+    );
+    attempts.push({
+      stage: "primary",
+      ok: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      rawReply: "",
+      error: error instanceof Error ? error.message : "Unknown model error."
+    });
+  }
+
+  const retryPrompt = buildRetryPrompt({
+    userText,
+    kbResults,
+    relevantImages,
+    config,
+    detectedLang,
+    imageIntent
+  });
+
+  try {
+    const retry = await openrouterService.chat(retryPrompt, {
+      maxTokens: Math.min(env.openrouterMaxTokens, 280),
+      temperature: 0.15
+    });
+    attempts.push({
+      stage: "retry",
+      ok: hasUsableReply(retry.reply),
+      inputTokens: retry.inputTokens,
+      outputTokens: retry.outputTokens,
+      rawReply: retry.reply
+    });
+
+    if (hasUsableReply(retry.reply)) {
+      return {
+        reply: retry.reply,
+        inputTokens: attempts.reduce((sum, item) => sum + Number(item.inputTokens || 0), 0),
+        outputTokens: attempts.reduce((sum, item) => sum + Number(item.outputTokens || 0), 0),
+        attempts,
+        recoveryMode: "retry"
+      };
+    }
+  } catch (error) {
+    logger.warn(
+      {
+        ...logContext,
+        err: error
+      },
+      "Retry model call failed or returned unusable output."
+    );
+    attempts.push({
+      stage: "retry",
+      ok: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      rawReply: "",
+      error: error instanceof Error ? error.message : "Unknown retry error."
+    });
+  }
+
+  return {
+    reply: buildGroundedFallbackReply({
+      kbResults,
+      detectedLang,
+      relevantImages,
+      imageIntent,
+      config
+    }),
+    inputTokens: attempts.reduce((sum, item) => sum + Number(item.inputTokens || 0), 0),
+    outputTokens: attempts.reduce((sum, item) => sum + Number(item.outputTokens || 0), 0),
+    attempts,
+    recoveryMode: "grounded_fallback"
+  };
 }
 
 async function getKnowledgeResults(userText, config) {
@@ -346,7 +554,16 @@ async function processIncomingMessage(incoming) {
     "Prompt built for model call."
   );
 
-  const chatResult = await openrouterService.chat(prompt);
+  const chatResult = await generateReplyWithRecovery({
+    prompt,
+    userText: parsed.text,
+    kbResults,
+    relevantImages,
+    config,
+    detectedLang,
+    imageIntent,
+    logContext
+  });
   const cleanReply = stripImageTags(chatResult.reply) || config.fallback_msg;
   const userRequestedImages = imageIntent.wantsImages;
   const requestedImageIds = parseImageTags(chatResult.reply);
@@ -373,6 +590,8 @@ async function processIncomingMessage(incoming) {
     {
       ...logContext,
       model: env.openrouterModel,
+      recoveryMode: chatResult.recoveryMode,
+      modelAttempts: chatResult.attempts,
       rawModelReply: chatResult.reply,
       cleanReply,
       imageIntent,

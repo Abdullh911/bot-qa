@@ -12,12 +12,12 @@ const openrouterClient = axios.create({
   }
 });
 
-async function chat(messages) {
+async function chat(messages, options = {}) {
   const response = await openrouterClient.post("/chat/completions", {
     model: env.openrouterModel,
     messages,
-    max_tokens: env.openrouterMaxTokens,
-    temperature: env.openrouterTemperature
+    max_tokens: options.maxTokens || env.openrouterMaxTokens,
+    temperature: options.temperature ?? env.openrouterTemperature
   });
 
   const choice = response.data && Array.isArray(response.data.choices) ? response.data.choices[0] : null;
