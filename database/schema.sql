@@ -231,54 +231,128 @@ alter table images enable row level security;
 alter table conversations enable row level security;
 alter table usage_log enable row level security;
 
+create or replace function is_business_owner(target_business_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select exists (
+    select 1
+    from businesses
+    where
+      id = target_business_id
+      and (
+        lower(owner_email) = lower(auth.jwt() ->> 'email')
+        or owner_id = auth.uid()
+      )
+  );
+$$;
+
 drop policy if exists owner_only_businesses on businesses;
-create policy owner_only_businesses on businesses
-  for all using (
+drop policy if exists owner_only_businesses_select on businesses;
+drop policy if exists owner_only_businesses_update on businesses;
+create policy owner_only_businesses_select on businesses
+  for select using (
+    lower(owner_email) = lower(auth.jwt() ->> 'email')
+    or owner_id = auth.uid()
+  );
+create policy owner_only_businesses_update on businesses
+  for update using (
+    lower(owner_email) = lower(auth.jwt() ->> 'email')
+    or owner_id = auth.uid()
+  )
+  with check (
     lower(owner_email) = lower(auth.jwt() ->> 'email')
     or owner_id = auth.uid()
   );
 
 drop policy if exists owner_only_knowledge_base on knowledge_base;
-create policy owner_only_knowledge_base on knowledge_base
-  for all using (
-    business_id in (
-      select id
-      from businesses
-      where
-        lower(owner_email) = lower(auth.jwt() ->> 'email')
-        or owner_id = auth.uid()
-    )
-  );
+drop policy if exists owner_only_knowledge_base_select on knowledge_base;
+drop policy if exists owner_only_knowledge_base_insert on knowledge_base;
+drop policy if exists owner_only_knowledge_base_update on knowledge_base;
+drop policy if exists owner_only_knowledge_base_delete on knowledge_base;
+create policy owner_only_knowledge_base_select on knowledge_base
+  for select using (is_business_owner(business_id));
+create policy owner_only_knowledge_base_insert on knowledge_base
+  for insert with check (is_business_owner(business_id));
+create policy owner_only_knowledge_base_update on knowledge_base
+  for update using (is_business_owner(business_id))
+  with check (is_business_owner(business_id));
+create policy owner_only_knowledge_base_delete on knowledge_base
+  for delete using (is_business_owner(business_id));
 
 drop policy if exists owner_only_images on images;
-create policy owner_only_images on images
-  for all using (
-    business_id in (
-      select id
-      from businesses
-      where
-        lower(owner_email) = lower(auth.jwt() ->> 'email')
-        or owner_id = auth.uid()
-    )
-  );
+drop policy if exists owner_only_images_select on images;
+drop policy if exists owner_only_images_insert on images;
+drop policy if exists owner_only_images_update on images;
+drop policy if exists owner_only_images_delete on images;
+create policy owner_only_images_select on images
+  for select using (is_business_owner(business_id));
+create policy owner_only_images_insert on images
+  for insert with check (is_business_owner(business_id));
+create policy owner_only_images_update on images
+  for update using (is_business_owner(business_id))
+  with check (is_business_owner(business_id));
+create policy owner_only_images_delete on images
+  for delete using (is_business_owner(business_id));
 
 drop policy if exists owner_only_conversations on conversations;
-create policy owner_only_conversations on conversations
-  for all using (
-    business_id in (
-      select id
+drop policy if exists owner_only_conversations_select on conversations;
+create policy owner_only_conversations_select on conversations
+  for select using (is_business_owner(business_id));
+
+drop policy if exists owner_only_usage_log on usage_log;
+drop policy if exists owner_only_usage_log_select on usage_log;
+create policy owner_only_usage_log_select on usage_log
+  for select using (is_business_owner(business_id));
+
+insert into storage.buckets (id, name, public)
+values ('business-images', 'business-images', true)
+on conflict (id) do nothing;
+
+drop policy if exists business_images_public_read on storage.objects;
+drop policy if exists business_images_owner_insert on storage.objects;
+drop policy if exists business_images_owner_update on storage.objects;
+drop policy if exists business_images_owner_delete on storage.objects;
+create policy business_images_public_read on storage.objects
+  for select using (bucket_id = 'business-images');
+create policy business_images_owner_insert on storage.objects
+  for insert with check (
+    bucket_id = 'business-images'
+    and split_part(name, '/', 1) in (
+      select id::text
       from businesses
       where
         lower(owner_email) = lower(auth.jwt() ->> 'email')
         or owner_id = auth.uid()
     )
   );
-
-drop policy if exists owner_only_usage_log on usage_log;
-create policy owner_only_usage_log on usage_log
-  for all using (
-    business_id in (
-      select id
+create policy business_images_owner_update on storage.objects
+  for update using (
+    bucket_id = 'business-images'
+    and split_part(name, '/', 1) in (
+      select id::text
+      from businesses
+      where
+        lower(owner_email) = lower(auth.jwt() ->> 'email')
+        or owner_id = auth.uid()
+    )
+  )
+  with check (
+    bucket_id = 'business-images'
+    and split_part(name, '/', 1) in (
+      select id::text
+      from businesses
+      where
+        lower(owner_email) = lower(auth.jwt() ->> 'email')
+        or owner_id = auth.uid()
+    )
+  );
+create policy business_images_owner_delete on storage.objects
+  for delete using (
+    bucket_id = 'business-images'
+    and split_part(name, '/', 1) in (
+      select id::text
       from businesses
       where
         lower(owner_email) = lower(auth.jwt() ->> 'email')

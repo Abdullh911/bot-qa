@@ -58,9 +58,10 @@ async function markMessageAsRead(messageId) {
 
 async function sendText(to, text) {
   const chunks = splitText(text);
+  const responses = [];
 
   for (const chunk of chunks) {
-    await sendPayload({
+    const response = await sendPayload({
       recipient_type: "individual",
       to,
       type: "text",
@@ -69,11 +70,21 @@ async function sendText(to, text) {
         preview_url: false
       }
     });
+    responses.push({
+      id: response && Array.isArray(response.messages) && response.messages[0]
+        ? response.messages[0].id
+        : null,
+      chunk
+    });
   }
+
+  return {
+    chunks: responses
+  };
 }
 
 async function sendImage(to, image) {
-  return sendPayload({
+  const response = await sendPayload({
     recipient_type: "individual",
     to,
     type: "image",
@@ -82,6 +93,14 @@ async function sendImage(to, image) {
       caption: image.caption || image.description || ""
     }
   });
+
+  return {
+    id: response && Array.isArray(response.messages) && response.messages[0]
+      ? response.messages[0].id
+      : null,
+    imageId: image.id,
+    url: image.url
+  };
 }
 
 module.exports = {
