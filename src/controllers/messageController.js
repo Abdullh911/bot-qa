@@ -513,90 +513,271 @@ async function processIncomingMessage(incoming) {
     return;
   }
 
+  let typingSession = null;
   try {
-    await whatsappService.markMessageAsRead(parsed.messageId);
+    typingSession = whatsappService.startTypingIndicator(parsed.messageId);
+    await typingSession.firstRun;
   } catch (error) {
-    logger.warn({ err: error, messageId: parsed.messageId }, "Failed to mark WhatsApp message as read.");
+    logger.warn(
+      { err: error, messageId: parsed.messageId },
+      "Failed to start WhatsApp typing indicator."
+    );
   }
 
-  const detectedLang = detectLanguage(parsed.text);
+  try {
+    const detectedLang = detectLanguage(parsed.text);
 
-  if (isGreetingMessage(parsed.text)) {
-    const greetingReply = buildGreetingReply(detectedLang, config);
-    const textSend = await whatsappService.sendText(parsed.from, greetingReply);
+    if (isGreetingMessage(parsed.text)) {
+      const greetingReply = buildGreetingReply(detectedLang, config);
+      const textSend = await whatsappService.sendText(parsed.from, greetingReply);
 
-    await supabaseService.appendConversationMessages(
-      env.businessId,
-      parsed.from,
-      [
-        buildConversationEntry("user", parsed.text, {
-          message_id: parsed.messageId
-        }),
-        buildConversationEntry("assistant", greetingReply, {
-          retrieval_mode: "greeting_shortcut",
-          input_tokens: 0,
-          output_tokens: 0,
-          cost_usd: 0
-        })
-      ],
-      env.maxHistoryMessages
-    );
+      await supabaseService.appendConversationMessages(
+        env.businessId,
+        parsed.from,
+        [
+          buildConversationEntry("user", parsed.text, {
+            message_id: parsed.messageId
+          }),
+          buildConversationEntry("assistant", greetingReply, {
+            retrieval_mode: "greeting_shortcut",
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0
+          })
+        ],
+        env.maxHistoryMessages
+      );
+
+      logger.info(
+        {
+          ...logContext,
+          detectedLanguage: detectedLang,
+          outgoingText: greetingReply,
+          textChunkCount: textSend.chunks.length,
+          textChunks: textSend.chunks.map((item) => ({
+            id: item.id,
+            preview: truncate(item.chunk, 160)
+          })),
+          retrievalMode: "greeting_shortcut",
+          inputTokens: 0,
+          outputTokens: 0,
+          costUsd: 0
+        },
+        "Greeting shortcut reply sent without retrieval or model call."
+      );
+      return;
+    }
 
     logger.info(
       {
         ...logContext,
         detectedLanguage: detectedLang,
-        outgoingText: greetingReply,
+        similarityThreshold: Number(
+          config.similarity_threshold ?? env.vectorSimilarityThreshold
+        ),
+        requestedTopK: Math.max(
+          10,
+          Number(config.vector_top_k || 0),
+          Number(env.vectorTopK || 0)
+        )
+      },
+      "Starting retrieval workflow."
+    );
+
+    const { kbResults, retrievalMode } = await getKnowledgeResults(parsed.text, config);
+    const history = await supabaseService.getConversation(env.businessId, parsed.from);
+    const imageIntent = getImageIntentDecision(parsed.text, kbResults);
+
+    logger.info(
+      {
+        ...logContext,
+        retrievalMode,
+        kbMatchCount: kbResults.length,
+        kbMatches: summarizeKbResults(kbResults),
+        imageIntent,
+        historyCount: history.length,
+        historyPreview: summarizeHistory(history)
+      },
+      "Knowledge retrieval finished."
+    );
+
+    if (kbResults.length === 0) {
+      const fallbackSend = await whatsappService.sendText(parsed.from, config.fallback_msg);
+      await supabaseService.appendConversationMessages(
+        env.businessId,
+        parsed.from,
+        [
+          buildConversationEntry("user", parsed.text, {
+            message_id: parsed.messageId
+          }),
+          buildConversationEntry("assistant", config.fallback_msg, {
+            retrieval_mode: retrievalMode
+          })
+        ],
+        env.maxHistoryMessages
+      );
+      logger.warn(
+        {
+          ...logContext,
+          retrievalMode,
+          outgoingText: config.fallback_msg,
+          whatsappMessageIds: fallbackSend.chunks.map((item) => item.id).filter(Boolean)
+        },
+        "No knowledge matched, fallback reply sent."
+      );
+      return;
+    }
+
+    const images = await supabaseService.getActiveImages(env.businessId);
+    const relevantImages = chooseRelevantImages({
+      queryText: parsed.text,
+      kbResults,
+      images,
+      maxImages: env.maxCandidateImages,
+      imageIntent
+    });
+
+    logger.info(
+      {
+        ...logContext,
+        imageIntent,
+        activeImageCount: images.length,
+        relevantImageCount: relevantImages.length,
+        relevantImages: summarizeImages(relevantImages)
+      },
+      "Image relevance selection finished."
+    );
+
+    const prompt = buildPrompt({
+      userText: parsed.text,
+      history,
+      kbResults,
+      relevantImages,
+      config,
+      detectedLang
+    });
+
+    logger.info(
+      {
+        ...logContext,
+        promptMessageCount: prompt.length,
+        promptSummary: summarizePrompt(prompt)
+      },
+      "Prompt built for model call."
+    );
+
+    const chatResult = await generateReplyWithRecovery({
+      prompt,
+      userText: parsed.text,
+      kbResults,
+      relevantImages,
+      config,
+      detectedLang,
+      imageIntent,
+      logContext
+    });
+    const cleanReply = stripImageTags(chatResult.reply) || config.fallback_msg;
+    const userRequestedImages = imageIntent.wantsImages;
+    const requestedImageIds = parseImageTags(chatResult.reply);
+    const allowedImageMap = buildAllowedImageMap(images);
+    const approvedImageIds = Array.from(new Set(requestedImageIds.map(normalizeReference)));
+    const modelApprovedImages = approvedImageIds
+      .map((imageId) => allowedImageMap.get(imageId))
+      .filter(Boolean);
+    const approvedImages = dedupeImages(
+      imageIntent.shouldAutoSend
+        ? [...relevantImages, ...modelApprovedImages]
+        : modelApprovedImages
+    );
+    const imageDeliveryStrategy =
+      imageIntent.shouldAutoSend && approvedImages.length > 0
+        ? requestedImageIds.length > 0
+          ? "auto_send_relevant_plus_model_tags"
+          : "auto_send_relevant_from_search"
+        : requestedImageIds.length > 0
+          ? "model_tags_only"
+          : "no_images_sent";
+
+    logger.info(
+      {
+        ...logContext,
+        model: env.openrouterModel,
+        recoveryMode: chatResult.recoveryMode,
+        modelAttempts: chatResult.attempts,
+        rawModelReply: chatResult.reply,
+        cleanReply,
+        imageIntent,
+        userRequestedImages,
+        requestedImageIds,
+        approvedImageIds,
+        approvedImages: summarizeImages(approvedImages),
+        imageDeliveryStrategy,
+        inputTokens: chatResult.inputTokens,
+        outputTokens: chatResult.outputTokens
+      },
+      "Model response generated."
+    );
+
+    const costUsd = calculateCost(chatResult.inputTokens, chatResult.outputTokens);
+    const deduction = await supabaseService.deductBalance(
+      env.businessId,
+      costUsd,
+      chatResult.inputTokens,
+      chatResult.outputTokens,
+      parsed.from
+    );
+
+    if (!deduction || !deduction.success) {
+      const lowBalanceSend = await whatsappService.sendText(parsed.from, config.low_balance_msg);
+      logger.warn(
+        {
+          ...logContext,
+          outgoingText: config.low_balance_msg,
+          costUsd,
+          whatsappMessageIds: lowBalanceSend.chunks.map((item) => item.id).filter(Boolean)
+        },
+        "Balance deduction failed after model call."
+      );
+      return;
+    }
+
+    const textSend = await whatsappService.sendText(parsed.from, cleanReply);
+    logger.info(
+      {
+        ...logContext,
+        outgoingText: cleanReply,
         textChunkCount: textSend.chunks.length,
         textChunks: textSend.chunks.map((item) => ({
           id: item.id,
           preview: truncate(item.chunk, 160)
-        })),
-        retrievalMode: "greeting_shortcut",
-        inputTokens: 0,
-        outputTokens: 0,
-        costUsd: 0
+        }))
       },
-      "Greeting shortcut reply sent without retrieval or model call."
+      "WhatsApp text reply sent."
     );
-    return;
-  }
 
-  logger.info(
-    {
-      ...logContext,
-      detectedLanguage: detectedLang,
-      similarityThreshold: Number(
-        config.similarity_threshold ?? env.vectorSimilarityThreshold
-      ),
-      requestedTopK: Math.max(
-        10,
-        Number(config.vector_top_k || 0),
-        Number(env.vectorTopK || 0)
-      )
-    },
-    "Starting retrieval workflow."
-  );
+    const sentImages = [];
+    for (const image of approvedImages) {
+      const sendImageResult = await whatsappService.sendImage(parsed.from, image);
+      sentImages.push(sendImageResult);
+    }
 
-  const { kbResults, retrievalMode } = await getKnowledgeResults(parsed.text, config);
-  const history = await supabaseService.getConversation(env.businessId, parsed.from);
-  const imageIntent = getImageIntentDecision(parsed.text, kbResults);
+    if (sentImages.length > 0) {
+      logger.info(
+        {
+          ...logContext,
+          userRequestedImages,
+          imageDeliveryStrategy,
+          sentImages
+        },
+        "WhatsApp image replies sent."
+      );
+    }
 
-  logger.info(
-    {
-      ...logContext,
-      retrievalMode,
-      kbMatchCount: kbResults.length,
-      kbMatches: summarizeKbResults(kbResults),
-      imageIntent,
-      historyCount: history.length,
-      historyPreview: summarizeHistory(history)
-    },
-    "Knowledge retrieval finished."
-  );
+    const assistantContent =
+      approvedImages.length > 0
+        ? `${cleanReply}\n\n[images: ${approvedImages.map((item) => item.id).join(", ")}]`
+        : cleanReply;
 
-  if (kbResults.length === 0) {
-    const fallbackSend = await whatsappService.sendText(parsed.from, config.fallback_msg);
     await supabaseService.appendConversationMessages(
       env.businessId,
       parsed.from,
@@ -604,204 +785,34 @@ async function processIncomingMessage(incoming) {
         buildConversationEntry("user", parsed.text, {
           message_id: parsed.messageId
         }),
-        buildConversationEntry("assistant", config.fallback_msg, {
+        buildConversationEntry("assistant", assistantContent, {
+          input_tokens: chatResult.inputTokens,
+          output_tokens: chatResult.outputTokens,
+          cost_usd: costUsd,
           retrieval_mode: retrievalMode
         })
       ],
       env.maxHistoryMessages
     );
-    logger.warn(
-      {
-        ...logContext,
-        retrievalMode,
-        outgoingText: config.fallback_msg,
-        whatsappMessageIds: fallbackSend.chunks.map((item) => item.id).filter(Boolean)
-      },
-      "No knowledge matched, fallback reply sent."
-    );
-    return;
-  }
 
-  const images = await supabaseService.getActiveImages(env.businessId);
-  const relevantImages = chooseRelevantImages({
-    queryText: parsed.text,
-    kbResults,
-    images,
-    maxImages: env.maxCandidateImages,
-    imageIntent
-  });
-
-  logger.info(
-    {
-      ...logContext,
-      imageIntent,
-      activeImageCount: images.length,
-      relevantImageCount: relevantImages.length,
-      relevantImages: summarizeImages(relevantImages)
-    },
-    "Image relevance selection finished."
-  );
-
-  const prompt = buildPrompt({
-    userText: parsed.text,
-    history,
-    kbResults,
-    relevantImages,
-    config,
-    detectedLang
-  });
-
-  logger.info(
-    {
-      ...logContext,
-      promptMessageCount: prompt.length,
-      promptSummary: summarizePrompt(prompt)
-    },
-    "Prompt built for model call."
-  );
-
-  const chatResult = await generateReplyWithRecovery({
-    prompt,
-    userText: parsed.text,
-    kbResults,
-    relevantImages,
-    config,
-    detectedLang,
-    imageIntent,
-    logContext
-  });
-  const cleanReply = stripImageTags(chatResult.reply) || config.fallback_msg;
-  const userRequestedImages = imageIntent.wantsImages;
-  const requestedImageIds = parseImageTags(chatResult.reply);
-  const allowedImageMap = buildAllowedImageMap(images);
-  const approvedImageIds = Array.from(new Set(requestedImageIds.map(normalizeReference)));
-  const modelApprovedImages = approvedImageIds
-    .map((imageId) => allowedImageMap.get(imageId))
-    .filter(Boolean);
-  const approvedImages = dedupeImages(
-    imageIntent.shouldAutoSend
-      ? [...relevantImages, ...modelApprovedImages]
-      : modelApprovedImages
-  );
-  const imageDeliveryStrategy =
-    imageIntent.shouldAutoSend && approvedImages.length > 0
-      ? requestedImageIds.length > 0
-        ? "auto_send_relevant_plus_model_tags"
-        : "auto_send_relevant_from_search"
-      : requestedImageIds.length > 0
-        ? "model_tags_only"
-        : "no_images_sent";
-
-  logger.info(
-    {
-      ...logContext,
-      model: env.openrouterModel,
-      recoveryMode: chatResult.recoveryMode,
-      modelAttempts: chatResult.attempts,
-      rawModelReply: chatResult.reply,
-      cleanReply,
-      imageIntent,
-      userRequestedImages,
-      requestedImageIds,
-      approvedImageIds,
-      approvedImages: summarizeImages(approvedImages),
-      imageDeliveryStrategy,
-      inputTokens: chatResult.inputTokens,
-      outputTokens: chatResult.outputTokens
-    },
-    "Model response generated."
-  );
-
-  const costUsd = calculateCost(chatResult.inputTokens, chatResult.outputTokens);
-  const deduction = await supabaseService.deductBalance(
-    env.businessId,
-    costUsd,
-    chatResult.inputTokens,
-    chatResult.outputTokens,
-    parsed.from
-  );
-
-  if (!deduction || !deduction.success) {
-    const lowBalanceSend = await whatsappService.sendText(parsed.from, config.low_balance_msg);
-    logger.warn(
-      {
-        ...logContext,
-        outgoingText: config.low_balance_msg,
-        costUsd,
-        whatsappMessageIds: lowBalanceSend.chunks.map((item) => item.id).filter(Boolean)
-      },
-      "Balance deduction failed after model call."
-    );
-    return;
-  }
-
-  const textSend = await whatsappService.sendText(parsed.from, cleanReply);
-  logger.info(
-    {
-      ...logContext,
-      outgoingText: cleanReply,
-      textChunkCount: textSend.chunks.length,
-      textChunks: textSend.chunks.map((item) => ({
-        id: item.id,
-        preview: truncate(item.chunk, 160)
-      }))
-    },
-    "WhatsApp text reply sent."
-  );
-
-  const sentImages = [];
-  for (const image of approvedImages) {
-    const sendImageResult = await whatsappService.sendImage(parsed.from, image);
-    sentImages.push(sendImageResult);
-  }
-
-  if (sentImages.length > 0) {
     logger.info(
       {
         ...logContext,
-        userRequestedImages,
-        imageDeliveryStrategy,
-        sentImages
+        retrievalMode,
+        kbMatches: kbResults.length,
+        imagesSent: approvedImages.length,
+        inputTokens: chatResult.inputTokens,
+        outputTokens: chatResult.outputTokens,
+        costUsd,
+        balanceAfter: deduction.balance_after
       },
-      "WhatsApp image replies sent."
+      "Processed incoming WhatsApp message."
     );
+  } finally {
+    if (typingSession) {
+      await typingSession.stop();
+    }
   }
-
-  const assistantContent =
-    approvedImages.length > 0
-      ? `${cleanReply}\n\n[images: ${approvedImages.map((item) => item.id).join(", ")}]`
-      : cleanReply;
-
-  await supabaseService.appendConversationMessages(
-    env.businessId,
-    parsed.from,
-    [
-      buildConversationEntry("user", parsed.text, {
-        message_id: parsed.messageId
-      }),
-      buildConversationEntry("assistant", assistantContent, {
-        input_tokens: chatResult.inputTokens,
-        output_tokens: chatResult.outputTokens,
-        cost_usd: costUsd,
-        retrieval_mode: retrievalMode
-      })
-    ],
-    env.maxHistoryMessages
-  );
-
-  logger.info(
-    {
-      ...logContext,
-      retrievalMode,
-      kbMatches: kbResults.length,
-      imagesSent: approvedImages.length,
-      inputTokens: chatResult.inputTokens,
-      outputTokens: chatResult.outputTokens,
-      costUsd,
-      balanceAfter: deduction.balance_after
-    },
-    "Processed incoming WhatsApp message."
-  );
 }
 
 async function processWebhook(body) {

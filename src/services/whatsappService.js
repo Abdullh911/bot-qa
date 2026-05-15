@@ -12,6 +12,8 @@ const whatsappClient = axios.create({
   }
 });
 
+const DEFAULT_TYPING_REFRESH_MS = 20_000;
+
 function splitText(text, maxLength = 3900) {
   const value = `${text || ""}`.trim();
   if (!value) {
@@ -54,6 +56,60 @@ async function markMessageAsRead(messageId) {
     status: "read",
     message_id: messageId
   });
+}
+
+async function sendTypingIndicator(messageId) {
+  if (!messageId) {
+    return null;
+  }
+
+  return sendPayload({
+    status: "read",
+    message_id: messageId,
+    typing_indicator: {
+      type: "text"
+    }
+  });
+}
+
+function startTypingIndicator(messageId, options = {}) {
+  if (!messageId) {
+    return {
+      stop() {}
+    };
+  }
+
+  const refreshMs = Math.max(Number(options.refreshMs) || DEFAULT_TYPING_REFRESH_MS, 5_000);
+  let stopped = false;
+  let intervalId = null;
+
+  const fire = async () => {
+    if (stopped) {
+      return;
+    }
+
+    await sendTypingIndicator(messageId);
+  };
+
+  const firstRun = fire().catch(() => {});
+  intervalId = setInterval(() => {
+    void fire().catch(() => {});
+  }, refreshMs);
+
+  if (typeof intervalId.unref === "function") {
+    intervalId.unref();
+  }
+
+  return {
+    firstRun,
+    async stop() {
+      stopped = true;
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+    }
+  };
 }
 
 async function sendText(to, text) {
@@ -105,6 +161,8 @@ async function sendImage(to, image) {
 
 module.exports = {
   markMessageAsRead,
+  sendTypingIndicator,
+  startTypingIndicator,
   sendText,
   sendImage
 };
