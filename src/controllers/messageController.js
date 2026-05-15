@@ -83,6 +83,62 @@ function dedupeImages(images) {
   return result;
 }
 
+function normalizeReference(value) {
+  return decodeURIComponent(`${value || ""}`).trim().toLowerCase();
+}
+
+function collectImageReferences(image) {
+  const references = new Set();
+  const imageId = normalizeReference(image && image.id);
+  const imageUrl = normalizeReference(image && image.url);
+
+  if (imageId) {
+    references.add(imageId);
+  }
+
+  if (imageUrl) {
+    references.add(imageUrl);
+
+    try {
+      const parsedUrl = new URL(image.url);
+      const pathname = normalizeReference(parsedUrl.pathname);
+      if (pathname) {
+        references.add(pathname);
+      }
+
+      const publicMarker = "/object/public/";
+      const markerIndex = pathname.indexOf(publicMarker);
+      if (markerIndex >= 0) {
+        const storagePath = pathname.slice(markerIndex + publicMarker.length);
+        if (storagePath) {
+          references.add(storagePath);
+
+          const parts = storagePath.split("/");
+          if (parts.length > 1) {
+            references.add(parts.slice(1).join("/"));
+          }
+        }
+      }
+    } catch (error) {
+      // Ignore malformed URLs and keep whatever plain-text references we already have.
+    }
+  }
+
+  return references;
+}
+
+function buildAllowedImageMap(images) {
+  const map = new Map();
+
+  for (const image of images || []) {
+    for (const reference of collectImageReferences(image)) {
+      map.set(reference, image);
+    }
+  }
+
+  return map;
+}
+
 async function getKnowledgeResults(userText, config) {
   const topK = Math.max(
     10,
@@ -285,8 +341,8 @@ async function processIncomingMessage(incoming) {
   const cleanReply = stripImageTags(chatResult.reply) || config.fallback_msg;
   const userRequestedImages = hasImageIntent(parsed.text);
   const requestedImageIds = parseImageTags(chatResult.reply);
-  const allowedImageMap = new Map(relevantImages.map((image) => [image.id, image]));
-  const approvedImageIds = Array.from(new Set(requestedImageIds));
+  const allowedImageMap = buildAllowedImageMap(relevantImages);
+  const approvedImageIds = Array.from(new Set(requestedImageIds.map(normalizeReference)));
   const modelApprovedImages = approvedImageIds
     .map((imageId) => allowedImageMap.get(imageId))
     .filter(Boolean);

@@ -100,7 +100,16 @@ function buildKnowledgeCorpus(kbResults) {
 }
 
 function hasImageIntent(queryText) {
-  return uniqueTokens(queryText).some((token) => IMAGE_INTENT_TERMS.has(token));
+  return uniqueTokens(queryText).some(
+    (token) =>
+      IMAGE_INTENT_TERMS.has(token) ||
+      token.includes("\u0635\u0648\u0631") ||
+      token.includes("\u0635\u0648\u0631\u0629") ||
+      token.includes("image") ||
+      token.includes("photo") ||
+      token.includes("picture") ||
+      token.includes("pic")
+  );
 }
 
 function buildKbText(item) {
